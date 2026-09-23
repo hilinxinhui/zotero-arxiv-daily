@@ -12,7 +12,10 @@ from queue import Empty
 from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
-import requests
+import httpx
+import subprocess
+import urllib.parse
+import urllib.request
 
 T = TypeVar("T")
 
@@ -21,13 +24,61 @@ PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
 
 
+class _ShimResponse:
+    """Minimal requests-like response for arxiv.py (status_code + content)."""
+
+    def __init__(self, status_code: int, content: bytes):
+        self.status_code = status_code
+        self.content = content
+
+
+class _HttpxSessionShim:
+    """arXiv's WAF throttles by client TLS fingerprint with HTTP 406, and any
+    single Python HTTP stack gets flagged after enough requests. The OS-bundled
+    curl has consistently been accepted, so metadata queries go through a curl
+    subprocess with a direct-httpx fallback. arxiv.py only calls
+    session.get(url, headers=...)."""
+
+    def get(self, url: str, headers: dict | None = None) -> _ShimResponse:
+        cmd = ["curl", "-sS", "--max-time", "60", "-w", "\n%{http_code}", url]
+        for key, value in (headers or {}).items():
+            cmd += ["-H", f"{key}: {value}"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+            body, _, status = proc.stdout.rpartition("\n")
+            if status.strip().isdigit() and int(status) == 200:
+                return _ShimResponse(200, body.encode("utf-8"))
+        except Exception:
+            pass
+        resp = httpx.get(url, headers=headers or {}, timeout=30, trust_env=False, follow_redirects=True)
+        return _ShimResponse(resp.status_code, resp.content)
+
+
+def _proxy_for(url: str) -> str | None:
+    """Resolve the Windows registry proxy for downloads (much faster to arXiv
+    from some networks); returns None (direct) when NO_PROXY matches the host,
+    which covers the WAF-guarded export.arxiv.org API endpoint."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    try:
+        if urllib.request.proxy_bypass(host):
+            return None
+    except Exception:
+        return None
+    # getproxies() short-circuits on any *_proxy env var (NO_PROXY makes it
+    # return {'no': ...}), so filter to real schemes and fall back to registry.
+    proxies = {k: v for k, v in urllib.request.getproxies_environment().items() if k in ("http", "https")}
+    if not proxies and os.name == "nt":
+        proxies = urllib.request.getproxies_registry()
+    return proxies.get("https") or proxies.get("http")
+
+
 def _download_file(url: str, path: str) -> None:
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+    timeout = httpx.Timeout(DOWNLOAD_TIMEOUT[1], connect=DOWNLOAD_TIMEOUT[0])
+    with httpx.stream("GET", url, timeout=timeout, proxy=_proxy_for(url), follow_redirects=True) as response:
         response.raise_for_status()
         with open(path, "wb") as file:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    file.write(chunk)
+            for chunk in response.iter_bytes(1024 * 1024):
+                file.write(chunk)
 
 
 def _run_in_subprocess(
@@ -114,7 +165,11 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        # num_retries=0: the lib's internal fast-fire retries keep arXiv's WAF
+        # flag hot (it answers HTTP 406 to clients hitting it too often), so all
+        # backoff is handled by the outer loop below instead.
+        client = arxiv.Client(num_retries=0, delay_seconds=10)
+        client._session = _HttpxSessionShim()
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -134,7 +189,7 @@ class ArxivRetriever(BaseRetriever):
         # Get full information of each paper from arxiv api
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 5
-        batch_retry_delay = 30
+        batch_retry_delay = 60
         for i in range(0, len(all_paper_ids), 20):
             search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
             for attempt in range(max_batch_retries):
@@ -143,15 +198,20 @@ class ArxivRetriever(BaseRetriever):
                     bar.update(len(batch))
                     raw_papers.extend(batch)
                     break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
+                except (arxiv.HTTPError, httpx.TransportError) as exc:
+                    # arXiv answers HTTP 406 (not 429) when throttling, and the
+                    # flag decays only after ~1 min of silence, hence the long
+                    # backoff. A batch that still fails is dropped so the rest
+                    # of the digest can proceed.
+                    if attempt < max_batch_retries - 1:
+                        wait = batch_retry_delay * min(attempt + 1, 2)
+                        status = getattr(exc, "status", None) or type(exc).__name__
+                        logger.warning(f"arXiv API {status} on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
                         sleep(wait)
                     else:
-                        raise
+                        logger.warning(f"Dropping batch {i // 20} ({len(all_paper_ids[i:i + 20])} papers) after {max_batch_retries} attempts")
             if i + 20 < len(all_paper_ids):
-                sleep(3)
+                sleep(5)
         bar.close()
 
         return raw_papers
@@ -178,7 +238,9 @@ class ArxivRetriever(BaseRetriever):
 
 
 def extract_text_from_html(paper: ArxivResult) -> str | None:
-    html_url = paper.entry_id.replace("/abs/", "/html/")
+    # entry_id comes back as http:// from the arXiv API; plain port-80 traffic
+    # to arxiv.org is commonly blocked, so force https.
+    html_url = paper.entry_id.replace("http://", "https://").replace("/abs/", "/html/")
     try:
         return _extract_text_from_html_worker(html_url)
     except Exception as exc:
